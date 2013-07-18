@@ -1,0 +1,191 @@
+diff -u openssh-6.2p2/auth2-pubkey.c openssh-6.2p2-patched/auth2-pubkey.c
+--- openssh-6.2p2/auth2-pubkey.c	2013-02-15 00:28:56.000000000 +0100
++++ openssh-6.2p2-patched/auth2-pubkey.c	2013-07-01 19:20:42.097394191 +0200
+@@ -428,6 +428,84 @@
+ 	return ret;
+ }
+ 
++
++/* check to see if the script specified by file can authorize the key
++ *
++ * the script will have the key written to STDIN, which is identical
++ * to the normal public key format.
++ *
++ * the script must exit with either 0 for success or 1 for failure.
++ * the script can print login options (if any) to STDOUT. No whitepace should be added
++ * to the output.
++ *
++ * Use with caution: the script can hang sshd. It is recommended you code the script
++ * with a timeout set if it cannot determine authenication quickly.
++ */
++static int	user_key_found_by_script(struct passwd *pw, Key *key, char *file)
++{
++  pid_t		pid;
++  char		line[SSH_MAX_PUBKEY_BYTES];
++  int		pipe_in[2];
++  int		pipe_out[2];
++  int		exit_code = 1;
++  int		success = 0;
++  FILE		*f;
++
++  pipe(pipe_in);
++  pipe(pipe_out);
++  temporarily_use_uid(pw);
++  debug3("user_key_found_by_script: executing %s", file);
++  switch ((pid = fork())) {
++  case -1:
++    error("fork(): %s", strerror(errno));
++    restore_uid();
++    return (-1);
++  case 0:
++    /* setup input pipe */
++    close(pipe_in[1]);
++    dup2(pipe_in[0], 0);
++    close(pipe_in[0]);
++    /* setup output pipe */
++    close(pipe_out[0]);
++    dup2(pipe_out[1], 1);
++    close(pipe_out[1]);
++    execl(file, file, NULL);
++    /* exec failed */
++    error("execl(): %s", strerror(errno));
++    _exit(1);
++  default:
++    debug3("user_key_found_by_script: script pid %d", pid);
++    close(pipe_in[0]);
++    close(pipe_out[1]);
++    f = fdopen(pipe_in[1], "w");
++    key_write(key, f);
++    fclose(f);
++    while(waitpid(pid, &exit_code, 0) < 0) {
++      switch(errno) {
++      case EINTR:
++	debug3("user_key_found_by_script: waitpid() EINTR, continuing");
++	continue;
++      default:
++	error("waitpid(): %s", strerror(errno));
++	goto waitpid_error;
++      }
++    }
++    if (WIFEXITED(exit_code) && WEXITSTATUS(exit_code) == 0) {
++      int amt_read = read(pipe_out[0], line, sizeof(line) - 1);
++      line[amt_read] = ' ';
++      line[amt_read + 1] = 0;
++      debug3("user_key_found_by_script: options: %s", line);
++      if (auth_parse_options(pw, line, file, 0) == 1)
++	success = 1;
++    }
++  waitpid_error:
++    close(pipe_out[0]);
++  }
++  restore_uid();
++  return success;
++}
++
++
+ /*
+  * Checks whether key is allowed in file.
+  * returns 1 if the key is allowed or 0 otherwise.
+@@ -631,7 +709,12 @@
+ 		success = user_key_allowed2(pw, key, file);
+ 		xfree(file);
+ 	}
+-
++	if (success > 0)
++	  return success;
++	if ((file = authorized_keys_script(pw))) {
++	  success = user_key_found_by_script(pw, key, file);
++	  xfree(file);
++	}
+ 	return success;
+ }
+ 
+diff -u openssh-6.2p2/auth.c openssh-6.2p2-patched/auth.c
+--- openssh-6.2p2/auth.c	2013-03-12 01:31:05.000000000 +0100
++++ openssh-6.2p2-patched/auth.c	2013-07-01 19:11:55.953410732 +0200
+@@ -368,6 +368,15 @@
+ 	return expand_authorized_keys(options.authorized_principals_file, pw);
+ }
+ 
++char *authorized_keys_script(struct passwd *pw)
++{
++  if (options.authorized_keys_script)
++    return expand_authorized_keys(options.authorized_keys_script, pw);
++  else
++    return NULL;
++}
++
++
+ /* return ok if key exists in sysfile or userfile */
+ HostStatus
+ check_key_in_hostfiles(struct passwd *pw, Key *key, const char *host,
+diff -u openssh-6.2p2/auth.h openssh-6.2p2-patched/auth.h
+--- openssh-6.2p2/auth.h	2012-12-02 23:53:20.000000000 +0100
++++ openssh-6.2p2-patched/auth.h	2013-07-01 19:13:01.381407811 +0200
+@@ -182,6 +182,7 @@
+ char	*expand_authorized_keys(const char *, struct passwd *pw);
+ char	*authorized_principals_file(struct passwd *);
+ 
++char	*authorized_keys_script(struct passwd *pw);
+ FILE	*auth_openkeyfile(const char *, struct passwd *, int);
+ FILE	*auth_openprincipals(const char *, struct passwd *, int);
+ int	 auth_key_is_revoked(Key *);
+diff -u openssh-6.2p2/servconf.c openssh-6.2p2-patched/servconf.c
+--- openssh-6.2p2/servconf.c	2013-02-12 01:02:08.000000000 +0100
++++ openssh-6.2p2-patched/servconf.c	2013-07-01 19:24:56.869390035 +0200
+@@ -143,6 +143,7 @@
+ 	options->revoked_keys_file = NULL;
+ 	options->trusted_user_ca_keys = NULL;
+ 	options->authorized_principals_file = NULL;
++	options->authorized_keys_script = NULL;
+ 	options->ip_qos_interactive = -1;
+ 	options->ip_qos_bulk = -1;
+ 	options->version_addendum = NULL;
+@@ -326,7 +327,7 @@
+ 	sMaxStartups, sMaxAuthTries, sMaxSessions,
+ 	sBanner, sUseDNS, sHostbasedAuthentication,
+ 	sHostbasedUsesNameFromPacketOnly, sClientAliveInterval,
+-	sClientAliveCountMax, sAuthorizedKeysFile,
++	sClientAliveCountMax, sAuthorizedKeysFile, sAuthorizedKeysScript,
+ 	sGssAuthentication, sGssCleanupCreds, sAcceptEnv, sPermitTunnel,
+ 	sMatch, sPermitOpen, sForceCommand, sChrootDirectory,
+ 	sUsePrivilegeSeparation, sAllowAgentForwarding,
+@@ -446,6 +447,7 @@
+ 	{ "clientalivecountmax", sClientAliveCountMax, SSHCFG_GLOBAL },
+ 	{ "authorizedkeysfile", sAuthorizedKeysFile, SSHCFG_ALL },
+ 	{ "authorizedkeysfile2", sDeprecated, SSHCFG_ALL },
++	{ "authorizedkeysscript", sAuthorizedKeysScript, SSHCFG_GLOBAL },
+ 	{ "useprivilegeseparation", sUsePrivilegeSeparation, SSHCFG_GLOBAL},
+ 	{ "acceptenv", sAcceptEnv, SSHCFG_ALL },
+ 	{ "permittunnel", sPermitTunnel, SSHCFG_ALL },
+@@ -1364,6 +1366,10 @@
+ 		}
+ 		break;
+ 
++	case sAuthorizedKeysScript:
++	  charptr = &options->authorized_keys_script;
++	  goto parse_filename;
++
+ 	case sClientAliveInterval:
+ 		intptr = &options->client_alive_interval;
+ 		goto parse_time;
+@@ -1965,6 +1971,7 @@
+ 	dump_cfg_string(sRevokedKeys, o->revoked_keys_file);
+ 	dump_cfg_string(sAuthorizedPrincipalsFile,
+ 	    o->authorized_principals_file);
++	dump_cfg_string(sAuthorizedKeysScript, o->authorized_keys_script);
+ 	dump_cfg_string(sVersionAddendum, o->version_addendum);
+ 	dump_cfg_string(sAuthorizedKeysCommand, o->authorized_keys_command);
+ 	dump_cfg_string(sAuthorizedKeysCommandUser, o->authorized_keys_command_user);
+diff -u openssh-6.2p2/servconf.h openssh-6.2p2-patched/servconf.h
+--- openssh-6.2p2/servconf.h	2013-01-09 05:56:45.000000000 +0100
++++ openssh-6.2p2-patched/servconf.h	2013-07-01 19:21:26.413393771 +0200
+@@ -160,7 +160,7 @@
+ 
+ 	u_int num_authkeys_files;	/* Files containing public keys */
+ 	char   *authorized_keys_files[MAX_AUTHKEYS_FILES];
+-
++  char   *authorized_keys_script;
+ 	char   *adm_forced_command;
+ 
+ 	int	use_pam;		/* Enable auth via PAM */
